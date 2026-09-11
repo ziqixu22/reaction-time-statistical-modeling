@@ -1,0 +1,347 @@
+---
+title: "Reaction Time Statistical Modeling"
+date: "2024-04-27"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Project Overview
+
+This project studies how demographic, behavioral, device, and environmental factors are associated with reaction time. The workflow includes data cleaning, exploratory data analysis, nonparametric testing, multiple linear regression, model selection, diagnostics, and a Box-Cox transformation.
+
+The analysis is observational. Reported associations should not be interpreted as causal effects.
+
+# Packages and Data
+
+```{r}
+library(tidyverse)
+library(corrplot)
+library(car)
+library(leaps)
+library(lmtest)
+library(MASS)
+```
+
+```{r}
+# Relative path keeps the analysis reproducible after cloning the repository.
+survey <- read.csv("Survey.csv")
+
+glimpse(survey)
+summary(survey$Reaction.time)
+```
+
+# Data Preparation
+
+Several sparse or closely related categorical levels are grouped to make the regression models easier to interpret and more stable.
+
+```{r}
+survey <- survey %>%
+  mutate(
+    Inputdevice.new = case_when(
+      Input.device %in% c("Game controller", "Mouse", "Keyboard") ~ "Click-based",
+      Input.device %in% c("Touch screen", "Trackpad") ~ "Tap-based",
+      TRUE ~ NA_character_
+    ),
+    Inputdevice.new = factor(Inputdevice.new, levels = c("Click-based", "Tap-based")),
+
+    Fatigue.new = case_when(
+      Fatigue.level %in% c("Extremely fatigued", "Very fatigued") ~ "High",
+      Fatigue.level == "Moderately fatigued" ~ "Moderate",
+      Fatigue.level %in% c("Not fatigued at all", "Slightly Fatigued") ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    Fatigue.new = factor(Fatigue.new, levels = c("Low", "Moderate", "High")),
+
+    Noise.new = case_when(
+      Noise.level %in% c("7", "8", "9") ~ "High",
+      Noise.level %in% c("4", "5", "6") ~ "Moderate",
+      Noise.level %in% c("1", "2", "3") ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    Noise.new = factor(Noise.new, levels = c("Low", "Moderate", "High")),
+
+    RightHand.new = factor(ifelse(Primary.hand == "Right hand", "Yes", "No"),
+                           levels = c("Yes", "No")),
+
+    Visual.new = case_when(
+      Visual.acuity %in% c("Very Poor", "Poor") ~ "Poor",
+      Visual.acuity == "Average" ~ "Average",
+      Visual.acuity == "Good" ~ "Good",
+      Visual.acuity == "Excellent" ~ "Excellent",
+      TRUE ~ NA_character_
+    ),
+    Visual.new = factor(Visual.new, levels = c("Excellent", "Good", "Average", "Poor")),
+
+    Temp.new = case_when(
+      Temp.level %in% c("Very Warm", "Warm") ~ "Warm",
+      Temp.level %in% c("Very Cold", "Cold") ~ "Cold",
+      Temp.level == "Neutral" ~ "Neutral",
+      TRUE ~ NA_character_
+    ),
+    Temp.new = factor(Temp.new, levels = c("Neutral", "Cold", "Warm")),
+
+    Cautious.new = case_when(
+      Cautious.level %in% c("Extremely cautious", "Very cautious") ~ "High",
+      Cautious.level == "Moderately cautious" ~ "Moderate",
+      Cautious.level %in% c("Not cautious at all", "Slightly cautious") ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    Cautious.new = factor(Cautious.new, levels = c("Low", "Moderate", "High")),
+
+    is_apple = ifelse(grepl("macOS|iOS|Apple|iPhone|iPad", Device.OS),
+                      "Apple", "Non-Apple"),
+    is_mobile = ifelse(grepl("Smartphone|Tablet|iPhone|iPad", Device.OS),
+                       "Mobile", "Non-Mobile")
+  ) %>%
+  select(-Alcohol.intake)
+```
+
+# Exploratory Data Analysis
+
+## Reaction-Time Distribution
+
+```{r}
+ggplot(survey, aes(x = Reaction.time)) +
+  geom_histogram(bins = 25, boundary = 0) +
+  labs(
+    title = "Distribution of Reaction Time",
+    x = "Reaction time (ms)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Correlation Among Numeric Variables
+
+```{r}
+numerical_data <- survey %>% select(where(is.numeric))
+corr_matrix <- cor(numerical_data, use = "complete.obs")
+corrplot(corr_matrix, method = "circle")
+```
+
+## Selected Bivariate Relationships
+
+```{r}
+ggplot(survey, aes(x = Age, y = Reaction.time)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Reaction Time vs. Age", x = "Age", y = "Reaction time (ms)") +
+  theme_minimal()
+
+ggplot(survey, aes(x = Avg.sleep.time, y = Reaction.time)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Reaction Time vs. Average Sleep", x = "Average sleep (hours)", y = "Reaction time (ms)") +
+  theme_minimal()
+
+ggplot(survey, aes(x = Inputdevice.new, y = Reaction.time)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.12) +
+  labs(title = "Reaction Time by Input Device", x = "Input-device group", y = "Reaction time (ms)") +
+  theme_minimal()
+```
+
+# Input-Device Comparison
+
+Because reaction times in the two input-device groups do not satisfy a normality assumption, a Wilcoxon rank-sum test is used to compare their distributions.
+
+```{r}
+click_based <- survey$Reaction.time[survey$Inputdevice.new == "Click-based"]
+tap_based <- survey$Reaction.time[survey$Inputdevice.new == "Tap-based"]
+
+shapiro.test(click_based)
+shapiro.test(tap_based)
+wilcox.test(click_based, tap_based, alternative = "two.sided")
+```
+
+In the original analysis, the Wilcoxon test returned a p-value of approximately 0.0025, providing evidence that reaction-time distributions differ between click-based and tap-based input devices.
+
+# Focused Regression: Age and Input Device
+
+```{r}
+model_age <- lm(Reaction.time ~ Age, data = survey)
+model_device <- lm(Reaction.time ~ Inputdevice.new, data = survey)
+model_additive <- lm(Reaction.time ~ Age + Inputdevice.new, data = survey)
+model_interaction <- lm(Reaction.time ~ Age * Inputdevice.new, data = survey)
+
+summary(model_additive)
+summary(model_interaction)
+```
+
+The interaction term tests whether the age slope differs by input-device group. In the original analysis, its p-value was approximately 0.55, so the data did not provide evidence for different age slopes across device groups.
+
+```{r}
+anova(model_age, model_additive)
+anova(model_additive, model_interaction)
+```
+
+The original nested-model comparison between the age-only and additive models produced a p-value of approximately 0.0077, supporting inclusion of input-device group in addition to age.
+
+```{r}
+ggplot(survey, aes(x = Age, y = Reaction.time, color = Inputdevice.new)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE) +
+  labs(
+    title = "Age and Reaction Time by Input-Device Group",
+    x = "Age",
+    y = "Reaction time (ms)",
+    color = "Input device"
+  ) +
+  theme_minimal()
+```
+
+# Multiple Regression and Model Selection
+
+```{r}
+survey_model <- survey %>%
+  select(
+    Reaction.time, Class, Avg.sleep.time, last.night.sleep.time, Awake.hours,
+    Stress.level, Distraction, Noise.new, Temp.new, Game.freq, Sport.freq,
+    Avg.hours.exercise, Caffein.intake, is_mobile, is_apple, Age,
+    Cautious.new, Inputdevice.new, Visual.new, RightHand.new,
+    Fatigue.new, WiFi.stable, Use.primary.hand
+  ) %>%
+  drop_na()
+
+full_model <- lm(Reaction.time ~ ., data = survey_model)
+summary(full_model)
+```
+
+Best-subset regression is used as a screening tool, with adjusted R-squared, Mallows' Cp, AIC, and BIC used to compare candidate model sizes.
+
+```{r}
+subset_fit <- regsubsets(Reaction.time ~ ., data = survey_model, nvmax = 12)
+subset_summary <- summary(subset_fit)
+
+n <- nrow(survey_model)
+model_size <- seq_along(subset_summary$rss) + 1
+AIC_values <- n * log(subset_summary$rss / n) + 2 * model_size
+BIC_values <- n * log(subset_summary$rss / n) + model_size * log(n)
+
+par(mfrow = c(2, 2))
+plot(model_size, subset_summary$adjr2, xlab = "Number of parameters", ylab = "Adjusted R-squared")
+plot(model_size, subset_summary$cp, xlab = "Number of parameters", ylab = "Mallows' Cp")
+plot(model_size, AIC_values, xlab = "Number of parameters", ylab = "AIC")
+plot(model_size, BIC_values, xlab = "Number of parameters", ylab = "BIC")
+par(mfrow = c(1, 1))
+```
+
+The original project selected the following reduced model after comparing candidate specifications.
+
+```{r}
+reduced_model <- lm(
+  Reaction.time ~ WiFi.stable + Visual.new + Inputdevice.new +
+    Avg.hours.exercise + Sport.freq + Temp.new + Stress.level + Class,
+  data = survey_model
+)
+
+summary(reduced_model)
+anova(reduced_model, full_model)
+```
+
+The original reduced-vs-full-model comparison returned a p-value of approximately 0.73, so the larger model did not show a statistically significant improvement over the reduced specification.
+
+# Model Diagnostics
+
+```{r}
+par(mfrow = c(2, 2))
+plot(reduced_model)
+par(mfrow = c(1, 1))
+
+vif(reduced_model)
+bptest(reduced_model)
+shapiro.test(resid(reduced_model))
+durbinWatsonTest(reduced_model)
+```
+
+For the Breusch-Pagan test, the null hypothesis is constant variance. In the original fit, the p-value was approximately 0.050, so the result was borderline and motivated additional attention to variance stability. The Shapiro-Wilk p-value was approximately 0.009, providing evidence against normal residuals. The Durbin-Watson test did not indicate residual autocorrelation.
+
+# Box-Cox Transformation
+
+```{r}
+boxcox(reduced_model, plotit = TRUE)
+
+# The original analysis used lambda = -0.5.
+lambda <- -0.5
+survey_model <- survey_model %>%
+  mutate(Transformed_Reaction.time = (Reaction.time^lambda - 1) / lambda)
+
+transformed_model <- lm(
+  Transformed_Reaction.time ~ WiFi.stable + Visual.new + Inputdevice.new +
+    Avg.hours.exercise + Sport.freq + Temp.new + Stress.level + Class,
+  data = survey_model
+)
+
+summary(transformed_model)
+AIC(reduced_model)
+AIC(transformed_model)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+plot(transformed_model)
+par(mfrow = c(1, 1))
+
+bptest(transformed_model)
+shapiro.test(resid(transformed_model))
+durbinWatsonTest(transformed_model)
+```
+
+In the original analysis, the transformed model had a Breusch-Pagan p-value above 0.05 and a Shapiro-Wilk p-value above 0.05, so there was less evidence against constant variance and residual normality after transformation.
+
+# Influence Diagnostics
+
+```{r}
+n <- nrow(survey_model)
+p <- length(coef(transformed_model))
+
+leverage <- hatvalues(transformed_model)
+high_leverage <- which(leverage > 2 * p / n)
+high_leverage
+
+studentized <- rstudent(transformed_model)
+bonferroni_cutoff <- abs(qt(0.05 / (2 * n), df.residual(transformed_model)))
+which(abs(studentized) > bonferroni_cutoff)
+
+cooks_d <- cooks.distance(transformed_model)
+which(cooks_d >= 1)
+
+plot(leverage, main = "Leverage Values", ylab = "Leverage")
+abline(h = 2 * p / n, lty = 2)
+
+plot(studentized, main = "Studentized Residuals", ylab = "Studentized residual")
+abline(h = c(-bonferroni_cutoff, bonferroni_cutoff), lty = 2)
+
+plot(cooks_d, main = "Cook's Distance", ylab = "Cook's distance")
+abline(h = 1, lty = 2)
+```
+
+# Lack-of-Fit Check for Exercise Hours
+
+A quadratic term is added for average exercise hours and compared with the transformed reduced model.
+
+```{r}
+transformed_quadratic <- lm(
+  Transformed_Reaction.time ~ WiFi.stable + Visual.new + Inputdevice.new +
+    Avg.hours.exercise + I(Avg.hours.exercise^2) + Sport.freq +
+    Temp.new + Stress.level + Class,
+  data = survey_model
+)
+
+anova(transformed_model, transformed_quadratic)
+```
+
+The original comparison produced a p-value of approximately 0.37, so the quadratic term did not provide evidence of a meaningful improvement over the linear exercise-hours term.
+
+# Takeaways
+
+The analysis demonstrates a complete statistical-modeling workflow: feature engineering, exploratory analysis, nonparametric testing, nested-model comparison, subset selection, regression diagnostics, response transformation, and influence analysis. A particularly consistent signal in the original analysis was the association between input-device group and reaction time, while the age-by-device interaction was not supported.
+
+Because the data are observational and self-reported in several fields, the results should be interpreted as associations rather than causal effects.
