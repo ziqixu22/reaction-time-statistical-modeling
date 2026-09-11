@@ -209,7 +209,7 @@ $$
 The Breusch-Pagan test evaluates whether
 
 $$
-\operatorname{Var}(\varepsilon_i)=\sigma^2.
+\mathrm{Var}(\varepsilon_i)=\sigma^2.
 $$
 
 The reduced model produced approximately
